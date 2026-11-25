@@ -80,18 +80,30 @@ def load_data():
     if CLINICS_FILE.exists():
         gdf_clinics = gpd.read_file(CLINICS_FILE)
         df_clinics = pd.DataFrame({
-            "name": gdf_clinics["name"].fillna("Primary Health Center"),
+            "name": gdf_clinics["name"].fillna("Primary Healthcare Facility"),
+            "lga_name": gdf_clinics["lga_name"].fillna("Lagos"),
             "lga": gdf_clinics["lga_name"].fillna("Lagos"),
             "lon": gdf_clinics.geometry.x,
-            "lat": gdf_clinics.geometry.y
+            "lat": gdf_clinics.geometry.y,
+            "prob_pct": "High (Inundation Corridor)",
+            "elev_fmt": "Lowland Coastal Plain",
+            "dist_fmt": "At-Risk Frontline Facility"
         })
     else:
         df_clinics = pd.DataFrame()
 
-    return df_exposure, sample_map, df_clinics, len(df_preds) if not df_preds.empty else 0
+    # Load flooded road segments
+    if ROADS_FILE.exists():
+        gdf_roads = gpd.read_file(ROADS_FILE)
+        if gdf_roads.crs is not None and gdf_roads.crs.to_epsg() != 4326:
+            gdf_roads = gdf_roads.to_crs(epsg=4326)
+    else:
+        gdf_roads = gpd.GeoDataFrame()
+
+    return df_exposure, sample_map, df_clinics, gdf_roads, len(df_preds) if not df_preds.empty else 0
 
 
-df_exposure, df_sample, df_clinics, total_monitored_cells = load_data()
+df_exposure, df_sample, df_clinics, gdf_roads, total_monitored_cells = load_data()
 
 # ----------------- Sidebar Controls -----------------
 st.sidebar.header("🕹️ Simulation Controls")
@@ -109,11 +121,31 @@ lga_list = ["All Lagos State"] + sorted(df_exposure["LGA"].unique().tolist()) if
 selected_lga = st.sidebar.selectbox("Filter by Local Government Area (LGA)", lga_list)
 
 st.sidebar.markdown("---")
+st.sidebar.subheader("🗺️ Basemap Style")
+basemap_label = st.sidebar.selectbox(
+    "Select Basemap",
+    options=[
+        "Carto Dark Matter (High Contrast Night - Recommended)",
+        "Carto Voyager (Detailed Streets & Place Names)",
+        "Carto Positron (Clean Light Street Map)"
+    ],
+    index=0
+)
+
+BASEMAP_URLS = {
+    "Carto Dark Matter (High Contrast Night - Recommended)": pdk.map_styles.CARTO_DARK,
+    "Carto Voyager (Detailed Streets & Place Names)": pdk.map_styles.CARTO_ROAD,
+    "Carto Positron (Clean Light Street Map)": pdk.map_styles.CARTO_LIGHT,
+}
+selected_basemap = BASEMAP_URLS[basemap_label]
+
+st.sidebar.markdown("---")
 st.sidebar.subheader("🗺️ Layer Visibility")
-show_heatmap = st.sidebar.checkbox("Flood Susceptibility Heatmap", value=True)
+show_heatmap = st.sidebar.checkbox("Flood Susceptibility Heatmap (Heat Glow)", value=True)
 show_points = st.sidebar.checkbox("100m Susceptibility Grid Points", value=True)
-show_clinics = st.sidebar.checkbox("At-Risk Health Clinics (Pins)", value=True)
-show_high_risk_only = st.sidebar.checkbox("Show High Risk Points Only (Prob ≥ 0.5)", value=False)
+show_roads = st.sidebar.checkbox("Submerged Road Corridors (Amber Lines)", value=True)
+show_clinics = st.sidebar.checkbox("At-Risk Health Clinics (Blue Pins)", value=True)
+show_high_risk_only = st.sidebar.checkbox("Show High Risk Points Only (Prob ≥ Cutoff)", value=False)
 
 # Filter map data
 if selected_lga != "All Lagos State" and not df_sample.empty:
@@ -184,22 +216,28 @@ tab_map, tab_rankings, tab_policy, tab_methodology = st.tabs([
 
 with tab_map:
     st.subheader(f"Geospatial Risk & Infrastructure Overlay: {selected_lga}")
-    st.caption("Derived from Sentinel-1 SAR, Copernicus 30m DEM, WorldPop & OpenStreetMap.")
+    st.caption("Underlying CartoDB basemap with Lagos street & water labels. Derived from Sentinel-1 SAR, Copernicus 30m DEM, WorldPop & OpenStreetMap.")
 
     if not display_data.empty:
+        display_data = display_data.copy()
+        
+        # Pre-format values into clean strings so Deck.gl tooltips display crisp numbers
+        display_data["prob_pct"] = (display_data["pred_prob"] * 100).round(1).astype(str) + "%"
+        display_data["elev_fmt"] = display_data["elevation"].round(1).astype(str) + " m"
+        display_data["dist_fmt"] = display_data["dist_water_m"].round(0).astype(int).astype(str) + " m"
+
         # Color coding: Green -> Yellow -> Orange -> Red
         colors = []
         for p in display_data["pred_prob"]:
             if p >= 0.70:
-                colors.append([220, 38, 38, 210])   # Red
+                colors.append([220, 38, 38, 220])   # Crimson Red (Very High)
             elif p >= 0.45:
-                colors.append([234, 88, 12, 180])   # Orange
+                colors.append([249, 115, 22, 190])  # Vibrant Orange (High)
             elif p >= 0.20:
-                colors.append([250, 204, 21, 140])  # Yellow
+                colors.append([234, 179, 8, 150])   # Amber Yellow (Moderate)
             else:
-                colors.append([34, 197, 94, 80])    # Green
+                colors.append([34, 197, 94, 90])    # Emerald Green (Low)
         
-        display_data = display_data.copy()
         display_data["color"] = colors
 
         center_lat = display_data["lat"].mean()
@@ -215,8 +253,9 @@ with tab_map:
                     get_position=["lon", "lat"],
                     get_weight="pred_prob",
                     radiusPixels=35,
-                    intensity=1.5,
-                    threshold=0.25,
+                    intensity=1.3,
+                    threshold=0.18,
+                    opacity=0.75,
                 )
             )
 
@@ -228,6 +267,18 @@ with tab_map:
                     get_position=["lon", "lat"],
                     get_fill_color="color",
                     get_radius=85,
+                    pickable=True,
+                )
+            )
+
+        if show_roads and not gdf_roads.empty:
+            layers.append(
+                pdk.Layer(
+                    "GeoJsonLayer",
+                    data=gdf_roads.__geo_interface__,
+                    get_line_color=[245, 158, 11, 230],  # Bright Amber lines
+                    get_line_width=40,
+                    line_width_min_pixels=3,
                     pickable=True,
                 )
             )
@@ -248,24 +299,66 @@ with tab_map:
             latitude=center_lat,
             longitude=center_lon,
             zoom=9.5 if selected_lga == "All Lagos State" else 11.5,
-            pitch=30,
+            pitch=25,
         )
 
         tooltip = {
-            "html": "<b>LGA:</b> {lga_name}<br/>"
-                    "<b>Flood Probability:</b> {pred_prob:.1%}<br/>"
-                    "<b>Elevation:</b> {elevation:.1f} m<br/>"
-                    "<b>Dist to Water:</b> {dist_water_m:.0f} m",
-            "style": {"backgroundColor": "#0f172a", "color": "white"}
+            "html": """
+                <div style="font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; font-size: 13px; line-height: 1.5; padding: 6px 10px; min-width: 170px;">
+                    <div style="font-size: 14px; font-weight: 700; color: #38bdf8; margin-bottom: 4px;">📍 {lga_name}</div>
+                    <div style="border-top: 1px solid #334155; margin: 4px 0 6px 0;"></div>
+                    <div><b>Flood Probability:</b> <span style="color: #f87171; font-weight: 700;">{prob_pct}</span></div>
+                    <div><b>Terrain Elevation:</b> {elev_fmt}</div>
+                    <div><b>Dist to Lagoon/Water:</b> {dist_fmt}</div>
+                </div>
+            """,
+            "style": {
+                "backgroundColor": "#0f172a",
+                "color": "#f8fafc",
+                "borderRadius": "8px",
+                "boxShadow": "0 8px 16px rgba(0, 0, 0, 0.4)",
+                "border": "1px solid #334155"
+            }
         }
 
         deck = pdk.Deck(
             layers=layers,
             initial_view_state=view_state,
             tooltip=tooltip,
-            map_style="mapbox://styles/mapbox/light-v9"
+            map_style=selected_basemap
         )
-        st.pydeck_chart(deck)
+        st.pydeck_chart(deck, use_container_width=True)
+
+        # Visual Map Legend
+        st.markdown("""
+        <div style="background-color: #1e293b; padding: 14px 20px; border-radius: 10px; margin-top: 10px; margin-bottom: 16px; border: 1px solid #334155;">
+            <div style="font-weight: 600; font-size: 14px; color: #f8fafc; margin-bottom: 8px;">🎨 Map Legend & Risk Classification</div>
+            <div style="display: flex; flex-wrap: wrap; gap: 16px; font-size: 13px; color: #cbd5e1;">
+                <div><span style="display:inline-block; width:12px; height:12px; background-color:#dc2626; border-radius:50%; margin-right:6px; vertical-align:middle;"></span><b>Very High Risk:</b> Prob ≥ 70% (Severe Inundation)</div>
+                <div><span style="display:inline-block; width:12px; height:12px; background-color:#f97316; border-radius:50%; margin-right:6px; vertical-align:middle;"></span><b>High Risk:</b> 45%–70% (Vulnerable Lowland)</div>
+                <div><span style="display:inline-block; width:12px; height:12px; background-color:#eab308; border-radius:50%; margin-right:6px; vertical-align:middle;"></span><b>Moderate Risk:</b> 20%–45% (Marginal Runoff)</div>
+                <div><span style="display:inline-block; width:12px; height:12px; background-color:#22c55e; border-radius:50%; margin-right:6px; vertical-align:middle;"></span><b>Low / Safe:</b> &lt; 20% (Elevated Upland)</div>
+                <div><span style="display:inline-block; width:12px; height:12px; background-color:#3b82f6; border-radius:50%; margin-right:6px; vertical-align:middle;"></span><b>Blue Pin:</b> At-Risk Health Clinic</div>
+                <div><span style="display:inline-block; width:18px; height:4px; background-color:#f59e0b; margin-right:6px; vertical-align:middle;"></span><b>Amber Line:</b> Submerged Road Corridor</div>
+            </div>
+        </div>
+        """, unsafe_allow_html=True)
+
+        with st.expander("📖 How to Interpret the Heatmap Colors & Risk Layers", expanded=True):
+            st.markdown("""
+            #### 1. What Does the Continuous Heat Glow Represent?
+            The **Heatmap Layer** computes a spatial density surface weighted by predicted flood susceptibility. It aggregates thousands of local prediction cells to highlight systemic flood basins across Lagos:
+            - 🔴 **Crimson / Deep Red Epicenter**: Indicates **hyper-concentrated flood susceptibility**. These are low-lying depressions ($<3\\text{m}$ elevation), coastal sandspits, and lagoon edges (e.g. Eti-Osa/Lekki, Apapa port basin, Ojo creeks, and Ikorodu waterfront) where stormwater naturally ponds and cannot discharge.
+            - 🟠 **Warm Orange Belt**: Transition zones ($45\% - 70\%$ probability) with high impervious built-up cover and moderate slopes where flash ponding occurs during cloudbursts.
+            - 🟡 **Faint Yellow Outer Halo**: Moderate risk perimeter ($20\% - 45\%$ probability) where topography gently rises above immediate flood levels.
+            - ⬛ **Translucent / Street Map Visible**: Areas with negligible risk ($<20\%$ probability) where elevated ridges (such as Ikeja GRA and inland Alimosho) remain safe from seasonal flooding.
+
+            ---
+
+            #### 2. 100m Susceptibility Grid Points vs. Heatmap Glow
+            - **Heatmap Layer (Macro View)**: Designed for **regional planning and emergency preparedness** — highlighting broad corridors at danger of isolation.
+            - **100m Grid Points (Micro View)**: Designed for **neighborhood engineers & asset managers** — each point represents an exact $100\\text{m} \\times 100\\text{m}$ (1 hectare) parcel. Hover your mouse over any dot to inspect its exact probability, local elevation, and proximity to open water.
+            """)
     else:
         st.info("Loading map layers...")
 
